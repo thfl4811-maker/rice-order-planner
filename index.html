@@ -101,6 +101,7 @@ td input,td select{padding:7px 8px;font-size:13px}
   <div class="wrap">
     <h1>만년형 쌀 발주 계산기</h1>
     <p>발주코드별 급식기간과 학교 재고·사용량을 반영해 백미·현미·찹쌀·잡곡의 권장 발주량을 자동 계산합니다.</p>
+    <div style="margin-top:8px;font-size:13px;color:#94a3b8;font-weight:700">개발자: 영양교사 김소리</div>
   </div>
 </header>
 
@@ -645,15 +646,40 @@ async function runOCR(){
   }
 }
 
+function cleanVendorTextForParsing(text){
+  return String(text||"")
+    .replace(/\r/g,"\n")
+    .replace(/[（]/g,"(")
+    .replace(/[）]/g,")")
+    .replace(/[：]/g,":")
+    .replace(/[～]/g,"~")
+    .replace(/[–—−]/g,"-")
+    .replace(/[ㆍ·]/g,".")
+    .replace(/\u00a0/g," ")
+    .replace(/[ \t]+/g," ")
+    .trim();
+}
+
+function stripDateDecorations(s){
+  return String(s||"")
+    // 날짜 뒤의 요일 괄호 제거: (월), (화요일), [월]
+    .replace(/\s*[\(\[]\s*[월화수목금토일]\s*(?:요일)?\s*[\)\]]\s*/g,"")
+    // 숫자 날짜 뒤에 붙은 불필요한 마침표 정리
+    .replace(/(\d)\.(?=\s*(?:~|-|부터|까지|$))/g,"$1")
+    .trim();
+}
+
 function parseDateToken(token, baseYear, fallbackMonth=null, fallbackYear=null){
   if(!token) return null;
-  const raw=String(token).trim();
 
-  let y, m, d;
+  const raw=stripDateDecorations(String(token).trim())
+    .replace(/\s+/g," ");
+
+  let y,m,d;
   let explicitYear=false;
   let explicitMonth=false;
 
-  // 2026년 8월 18일 / 8월 18일
+  // 2026년 8월 18일 / 8월 18일 / 8월18일
   let km=raw.match(/(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일?/);
   if(km){
     explicitYear=!!km[1];
@@ -662,7 +688,7 @@ function parseDateToken(token, baseYear, fallbackMonth=null, fallbackYear=null){
     m=Number(km[2]);
     d=Number(km[3]);
   }else{
-    // 2026-08-18 / 2026.08.18 / 2026/08/18 / 8-18 / 8.18 / 8/18
+    // 2026/8/18, 2026.8.18, 2026-8-18, 8/18, 8.18, 8-18
     let nm=raw.match(/(?:(\d{4})\s*[\/.\-]\s*)?(\d{1,2})\s*[\/.\-]\s*(\d{1,2})/);
     if(nm){
       explicitYear=!!nm[1];
@@ -671,7 +697,7 @@ function parseDateToken(token, baseYear, fallbackMonth=null, fallbackYear=null){
       m=Number(nm[2]);
       d=Number(nm[3]);
     }else{
-      // 범위의 두 번째 날짜에서 월이 생략된 경우: 8/18~22, 8월18일~22일
+      // 두 번째 날짜의 월 생략: 8/18~22, 8월18일~22일
       let dm=raw.match(/^(\d{1,2})\s*일?$/);
       if(!dm || !fallbackMonth) return null;
       y=Number(fallbackYear||baseYear);
@@ -706,23 +732,32 @@ function inferYearForRange(startToken,endToken,baseYear){
   if(!b) return [a.year,a.year];
 
   let ey=b.year;
-  if(!b.explicitYear && b.explicitMonth && b.month<a.month){
-    ey=a.year+1;
-  }
+  if(!b.explicitYear && b.explicitMonth && b.month<a.month) ey=a.year+1;
   return [a.year,ey];
 }
 
 function extractDateRanges(line,baseYear){
-  // 시작 날짜는 반드시 월/일 또는 년/월/일 형태,
-  // 종료 날짜는 같은 형식 또는 '22일', '22'처럼 일자만 있어도 허용
-  const fullDate='(?:\\d{4}\\s*년\\s*)?\\d{1,2}\\s*월\\s*\\d{1,2}\\s*일?|(?:\\d{4}\\s*[\\/.\\-]\\s*)?\\d{1,2}\\s*[\\/.\\-]\\s*\\d{1,2}';
-  const endDate=`(?:${fullDate}|\\d{1,2}\\s*일?)`;
-  const re=new RegExp(`(${fullDate})\\s*(?:~|～|–|—|-|부터)\\s*(${endDate})(?:\\s*까지)?`,"g");
+  const src=cleanVendorTextForParsing(line);
+
+  // 날짜 뒤에 (월), (화요일), 마침표가 들어가도 허용
+  const dow='(?:\\s*[\\(\\[]\\s*[월화수목금토일]\\s*(?:요일)?\\s*[\\)\\]])?';
+  const tailDot='(?:\\s*\\.)?';
+
+  const ymdKor='(?:\\d{4}\\s*년\\s*)?\\d{1,2}\\s*월\\s*\\d{1,2}\\s*일?';
+  const ymdNum='(?:\\d{4}\\s*[\\/.\\-]\\s*)?\\d{1,2}\\s*[\\/.\\-]\\s*\\d{1,2}';
+  const fullDate=`(?:${ymdKor}|${ymdNum})${tailDot}${dow}`;
+  const shortEnd=`\\d{1,2}\\s*일?${tailDot}${dow}`;
+  const endDate=`(?:${fullDate}|${shortEnd})`;
+
+  const re=new RegExp(
+    `(${fullDate})\\s*(?:~|-|부터\\s*)\\s*(${endDate})(?:\\s*까지)?`,
+    "g"
+  );
 
   const out=[];
   let m;
 
-  while((m=re.exec(line))){
+  while((m=re.exec(src))){
     const a=parseDateToken(m[1],baseYear);
     if(!a) continue;
 
@@ -732,9 +767,6 @@ function extractDateRanges(line,baseYear){
     let endYear=b.year;
     if(!b.explicitYear && b.explicitMonth && b.month<a.month){
       endYear=a.year+1;
-    }
-
-    if(endYear!==b.year){
       b={
         ...b,
         year:endYear,
@@ -753,13 +785,34 @@ function extractDateRanges(line,baseYear){
   return out;
 }
 
+function extractSingleDates(line,baseYear){
+  const src=cleanVendorTextForParsing(line);
+  const re=/(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일?|(?:(\d{4})\s*[\/.\-]\s*)?(\d{1,2})\s*[\/.\-]\s*(\d{1,2})/g;
+  const out=[];
+  let m;
+  while((m=re.exec(src))){
+    const token=m[0];
+    const p=parseDateToken(token,baseYear);
+    if(p) out.push({date:p.date,index:m.index,raw:token});
+  }
+  return out;
+}
+
+function detectLineType(line){
+  const s=String(line||"");
+  if(/배송|납품|입고|도착|배달|납기/.test(s)) return "delivery";
+  if(/급식|사용기간|사용일|학교사용|식사|식단|소비기간/.test(s)) return "meal";
+  return "";
+}
+
 function analyzeVendorText(){
-  const text=document.getElementById("vendorText").value.trim();
-  if(!text){
+  const raw=document.getElementById("vendorText").value.trim();
+  if(!raw){
     alert("분석할 업체 안내문을 입력하세요.");
     return;
   }
 
+  const text=cleanVendorTextForParsing(raw);
   const baseYear=Number(document.getElementById("baseYear").value||new Date().getFullYear());
   const lines=text.split(/\n+/).map(x=>x.trim()).filter(Boolean);
 
@@ -785,30 +838,18 @@ function analyzeVendorText(){
 
   for(const line of lines){
     const labelMatch=line.match(/((?:\d{1,2}월\s*)?(?:제\s*)?\d+\s*차)/);
-
-    // 발주코드 / 주문코드 / 코드 / 차수 뒤의 값 추출
-    const codeMatch=line.match(/(?:발주\s*코드|주문\s*코드|코드)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_./\-]*)/i);
+    const codeMatch=line.match(/(?:발주\s*코드|주문\s*코드|코드|차수)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_./\-]*)/i);
 
     if(labelMatch){
       const label=labelMatch[1].replace(/\s/g,"");
-
-      // 새로운 차수가 시작되면 이전 차수 저장
-      if(current && hasData(current) && current.label!==label){
-        pushCurrent();
-      }
-
+      if(current && hasData(current) && current.label!==label) pushCurrent();
       if(!current) current=blank(label);
       else current.label=label;
     }
 
     if(codeMatch){
       const code=codeMatch[1].replace(/\s/g,"");
-
-      // 이미 다른 코드가 들어있다면 새 차수로 판단
-      if(current && hasData(current) && current.code && current.code!==code){
-        pushCurrent();
-      }
-
+      if(current && hasData(current) && current.code && current.code!==code) pushCurrent();
       if(!current) current=blank();
       current.code=code;
     }
@@ -816,50 +857,79 @@ function analyzeVendorText(){
     if(!current) current=blank();
 
     const ranges=extractDateRanges(line,baseYear);
+    const type=detectLineType(line);
 
-    for(const r of ranges){
-      const before=line.slice(Math.max(0,r.index-40),r.index);
-      const after=line.slice(r.index,r.index+r.raw.length+15);
-      const nearby=before+" "+after;
+    if(ranges.length){
+      for(const r of ranges){
+        let target=type;
 
-      let target="";
+        if(!target){
+          target=!current.mealStart?"meal":(!current.delStart?"delivery":"meal");
+        }
 
-      if(/배송|납품|입고|도착|배달/.test(nearby)){
-        target="delivery";
-      }else if(/급식|사용기간|사용일|학교사용|식사|식단/.test(nearby)){
-        target="meal";
-      }else{
-        target=!current.mealStart?"meal":(!current.delStart?"delivery":"meal");
+        if(target==="meal"){
+          if(current.mealStart && current.delStart){
+            pushCurrent();
+            current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
+            if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+          }
+          current.mealStart=r.start;
+          current.mealEnd=r.end;
+        }else{
+          if(current.delStart && current.mealStart){
+            pushCurrent();
+            current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
+            if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+          }
+          current.delStart=r.start;
+          current.delEnd=r.end;
+        }
       }
+      continue;
+    }
 
-      if(target==="meal"){
-        // 한 차수 안에 급식+배송이 이미 모두 채워졌는데 또 급식기간이 나오면 새 차수
-        if(current.mealStart && current.delStart){
-          pushCurrent();
-          current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
-          if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
-        }
-
-        current.mealStart=r.start;
-        current.mealEnd=r.end;
+    // 배송일 8/13 처럼 범위가 아니라 하루만 적힌 경우도 허용
+    const singles=extractSingleDates(line,baseYear);
+    if(singles.length && type){
+      const d=singles[0].date;
+      if(type==="meal"){
+        current.mealStart=current.mealStart||d;
+        current.mealEnd=current.mealEnd||d;
       }else{
-        // 한 차수 안에 급식+배송이 이미 모두 채워졌는데 또 배송기간이 나오면 새 차수
-        if(current.delStart && current.mealStart){
-          pushCurrent();
-          current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
-          if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
-        }
-
-        current.delStart=r.start;
-        current.delEnd=r.end;
+        current.delStart=current.delStart||d;
+        current.delEnd=current.delEnd||d;
       }
     }
   }
 
   pushCurrent();
 
-  // 줄바꿈이 깨져 한 문장처럼 붙은 경우 전체 날짜범위를 순서대로 복구
+  // 1차 보정: 전체 텍스트에서 라벨 키워드가 포함된 날짜 범위를 다시 직접 탐색
   if(!found.length || found.every(x=>!x.mealStart&&!x.delStart)){
+    const wholeLines=text.split(/\n+/).filter(Boolean);
+    let fallback=blank("1차");
+
+    for(const line of wholeLines){
+      const type=detectLineType(line);
+      const ranges=extractDateRanges(line,baseYear);
+
+      if(type && ranges.length){
+        const r=ranges[0];
+        if(type==="meal"){
+          fallback.mealStart=r.start;
+          fallback.mealEnd=r.end;
+        }else{
+          fallback.delStart=r.start;
+          fallback.delEnd=r.end;
+        }
+      }
+    }
+
+    if(hasData(fallback)) found.push(fallback);
+  }
+
+  // 2차 보정: 키워드 없이 날짜 범위만 여러 개 있는 경우 순서대로 급식/배송 묶기
+  if(!found.length){
     const ranges=extractDateRanges(text,baseYear);
 
     for(let i=0;i<ranges.length;i+=2){
@@ -878,7 +948,7 @@ function analyzeVendorText(){
     }
   }
 
-  // 코드 행과 날짜 행이 따로 있어 중복 차수가 생긴 경우 인접 행끼리 보완 병합
+  // 인접한 불완전 행 병합
   const merged=[];
 
   for(const row of found){
@@ -895,10 +965,7 @@ function analyzeVendorText(){
       prev.mealEnd=prev.mealEnd||row.mealEnd;
       prev.delStart=prev.delStart||row.delStart;
       prev.delEnd=prev.delEnd||row.delEnd;
-
-      if(/^\d+차$/.test(prev.label||"") && row.label){
-        prev.label=row.label;
-      }
+      if(/^\d+차$/.test(prev.label||"") && row.label) prev.label=row.label;
     }else{
       merged.push({...row});
     }
