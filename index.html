@@ -122,7 +122,7 @@ td input,td select{padding:7px 8px;font-size:13px}
           <div class="field">
             <label>업체 문자·카카오톡 이미지</label>
             <input id="vendorImage" type="file" accept="image/*">
-            <div class="helper">이미지를 올린 뒤 ‘사진 글자 읽기’를 누르세요. OCR 결과는 반드시 확인 후 적용합니다.</div>
+            <div class="helper">이미지를 올리면 검은 여백을 자동 제거하고 표를 확대해 읽습니다. ‘사진 글자 읽기’를 누른 뒤 추출된 날짜를 확인하세요.</div>
           </div>
           <img id="vendorPreview" alt="업로드 미리보기" style="display:none;width:100%;max-height:280px;object-fit:contain;border:1px solid var(--line);border-radius:12px;background:#f8fafc">
           <div class="actions">
@@ -628,21 +628,180 @@ document.getElementById("vendorImage").addEventListener("change", e=>{
   img.style.display="block";
 });
 
+function loadImageFile(file){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    img.onload=()=>resolve(img);
+    img.onerror=reject;
+    img.src=URL.createObjectURL(file);
+  });
+}
+
+function getDocumentBounds(img){
+  const temp=document.createElement("canvas");
+  const maxW=1200;
+  const scale=Math.min(1,maxW/img.width);
+  temp.width=Math.max(1,Math.round(img.width*scale));
+  temp.height=Math.max(1,Math.round(img.height*scale));
+
+  const ctx=temp.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(img,0,0,temp.width,temp.height);
+
+  const data=ctx.getImageData(0,0,temp.width,temp.height).data;
+
+  let minX=temp.width, minY=temp.height, maxX=0, maxY=0;
+  let found=false;
+
+  // 검은 여백이 큰 문자 캡처를 대비해
+  // 밝은 문서 영역을 찾는다.
+  for(let y=0;y<temp.height;y+=2){
+    for(let x=0;x<temp.width;x+=2){
+      const i=(y*temp.width+x)*4;
+      const r=data[i], g=data[i+1], b=data[i+2];
+      const lum=(r+g+b)/3;
+
+      // 거의 흰색~밝은 회색 문서 영역
+      if(lum>170){
+        found=true;
+        if(x<minX) minX=x;
+        if(y<minY) minY=y;
+        if(x>maxX) maxX=x;
+        if(y>maxY) maxY=y;
+      }
+    }
+  }
+
+  if(!found){
+    return {x:0,y:0,w:img.width,h:img.height};
+  }
+
+  // 약간의 여백 추가
+  const pad=12;
+  minX=Math.max(0,minX-pad);
+  minY=Math.max(0,minY-pad);
+  maxX=Math.min(temp.width-1,maxX+pad);
+  maxY=Math.min(temp.height-1,maxY+pad);
+
+  return {
+    x:Math.round(minX/scale),
+    y:Math.round(minY/scale),
+    w:Math.round((maxX-minX+1)/scale),
+    h:Math.round((maxY-minY+1)/scale)
+  };
+}
+
+function preprocessImageForOCR(img){
+  const bounds=getDocumentBounds(img);
+
+  // 작은 표 글씨를 위해 3배 확대
+  const upscale=3;
+  const canvas=document.createElement("canvas");
+  canvas.width=Math.max(1,Math.round(bounds.w*upscale));
+  canvas.height=Math.max(1,Math.round(bounds.h*upscale));
+
+  const ctx=canvas.getContext("2d",{willReadFrequently:true});
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality="high";
+  ctx.drawImage(
+    img,
+    bounds.x,bounds.y,bounds.w,bounds.h,
+    0,0,canvas.width,canvas.height
+  );
+
+  const image=ctx.getImageData(0,0,canvas.width,canvas.height);
+  const d=image.data;
+
+  // 흑백 + 강한 대비.
+  // 파랑/빨강 날짜도 모두 검정 글자로 변환되도록 처리한다.
+  for(let i=0;i<d.length;i+=4){
+    const r=d[i], g=d[i+1], b=d[i+2];
+
+    // 색 글씨 보존을 위해 단순 평균보다 가장 어두운 채널을 중시
+    let gray=Math.min(r,g,b)*0.65 + ((r+g+b)/3)*0.35;
+
+    // 대비 강화
+    gray=(gray-128)*1.65+128;
+
+    // 문서 배경은 희게, 글자는 진하게
+    if(gray>205) gray=255;
+    else if(gray<105) gray=0;
+
+    gray=Math.max(0,Math.min(255,gray));
+
+    d[i]=gray;
+    d[i+1]=gray;
+    d[i+2]=gray;
+  }
+
+  ctx.putImageData(image,0,0);
+
+  return canvas;
+}
+
 async function runOCR(){
   const file=document.getElementById("vendorImage").files?.[0];
-  if(!file){alert("먼저 문자 캡처 이미지를 올려주세요.");return}
+
+  if(!file){
+    alert("먼저 문자 캡처 이미지를 올려주세요.");
+    return;
+  }
+
   const status=document.getElementById("ocrStatus");
-  status.textContent="사진의 글자를 읽는 중입니다. 이미지 크기에 따라 잠시 걸릴 수 있습니다.";
+  status.textContent="문서 영역을 찾고 글자를 선명하게 만드는 중입니다.";
+
+  let worker=null;
+
   try{
-    const result=await Tesseract.recognize(file,"kor+eng",{
+    const img=await loadImageFile(file);
+    const processed=preprocessImageForOCR(img);
+
+    status.textContent="표와 날짜를 읽는 중입니다. 잠시 기다려 주세요.";
+
+    // createWorker 방식으로 PSM과 공백 보존 옵션을 직접 지정
+    worker=await Tesseract.createWorker("kor+eng",1,{
       logger:m=>{
-        if(m.status==="recognizing text") status.textContent=`글자 인식 중 ${Math.round((m.progress||0)*100)}%`;
+        if(m.status==="recognizing text"){
+          status.textContent=`표와 날짜 인식 중 ${Math.round((m.progress||0)*100)}%`;
+        }
       }
     });
-    document.getElementById("vendorText").value=result.data.text||"";
-    status.textContent="글자 읽기가 끝났습니다. 내용 확인 후 ‘자동 분석’을 누르세요.";
+
+    await worker.setParameters({
+      tessedit_pageseg_mode:"6",
+      preserve_interword_spaces:"1"
+    });
+
+    const result=await worker.recognize(processed);
+
+    let ocrText=(result?.data?.text||"").trim();
+
+    // 표 인식에서 자주 발생하는 기호 OCR 오류를 가볍게 정리
+    ocrText=ocrText
+      .replace(/[|｜]/g," ")
+      .replace(/[~〜∼]/g,"~")
+      .replace(/(\d)\s*[Oo]\s*(?=\d)/g,"$1 0 ")
+      .replace(/[ \t]+/g," ")
+      .replace(/\n{3,}/g,"\n\n");
+
+    document.getElementById("vendorText").value=ocrText;
+
+    if(!ocrText){
+      status.textContent="글자를 충분히 읽지 못했습니다. 표 부분만 잘라 다시 올리면 인식률이 높아집니다.";
+      return;
+    }
+
+    status.textContent="글자 읽기가 끝났습니다. 날짜 일정도 자동으로 분석합니다.";
+
+    // OCR 직후 자동분석까지 연속 실행
+    analyzeVendorText();
+
   }catch(err){
-    status.textContent="글자 인식에 실패했습니다. 문자 내용을 복사해 붙여넣거나 일정을 직접 입력하세요.";
+    console.error("OCR error:",err);
+    status.textContent="글자 인식 중 오류가 발생했습니다. 표 부분만 잘라 다시 올리거나 문자 원문을 붙여넣어 주세요.";
+  }finally{
+    if(worker){
+      try{await worker.terminate();}catch(e){}
+    }
   }
 }
 
