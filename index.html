@@ -645,79 +645,272 @@ async function runOCR(){
   }
 }
 
-function normalizeDateToken(token, year){
-  if(!token) return "";
-  token=String(token).trim().replace(/[.\-]/g,"/").replace(/\s/g,"");
-  let m=token.match(/(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})/);
-  if(!m) return "";
-  const y=Number(m[1]||year);
-  const mm=String(Number(m[2])).padStart(2,"0");
-  const dd=String(Number(m[3])).padStart(2,"0");
-  return `${y}-${mm}-${dd}`;
+function parseDateToken(token, baseYear, fallbackMonth=null, fallbackYear=null){
+  if(!token) return null;
+  const raw=String(token).trim();
+
+  let y, m, d;
+  let explicitYear=false;
+  let explicitMonth=false;
+
+  // 2026년 8월 18일 / 8월 18일
+  let km=raw.match(/(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일?/);
+  if(km){
+    explicitYear=!!km[1];
+    explicitMonth=true;
+    y=Number(km[1]||fallbackYear||baseYear);
+    m=Number(km[2]);
+    d=Number(km[3]);
+  }else{
+    // 2026-08-18 / 2026.08.18 / 2026/08/18 / 8-18 / 8.18 / 8/18
+    let nm=raw.match(/(?:(\d{4})\s*[\/.\-]\s*)?(\d{1,2})\s*[\/.\-]\s*(\d{1,2})/);
+    if(nm){
+      explicitYear=!!nm[1];
+      explicitMonth=true;
+      y=Number(nm[1]||fallbackYear||baseYear);
+      m=Number(nm[2]);
+      d=Number(nm[3]);
+    }else{
+      // 범위의 두 번째 날짜에서 월이 생략된 경우: 8/18~22, 8월18일~22일
+      let dm=raw.match(/^(\d{1,2})\s*일?$/);
+      if(!dm || !fallbackMonth) return null;
+      y=Number(fallbackYear||baseYear);
+      m=Number(fallbackMonth);
+      d=Number(dm[1]);
+    }
+  }
+
+  const dt=new Date(y,m-1,d);
+  if(dt.getFullYear()!==y || dt.getMonth()!==m-1 || dt.getDate()!==d) return null;
+
+  return {
+    year:y,
+    month:m,
+    day:d,
+    explicitYear,
+    explicitMonth,
+    date:`${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}`
+  };
+}
+
+function normalizeDateToken(token, year, fallbackMonth=null){
+  const p=parseDateToken(token,year,fallbackMonth,year);
+  return p?p.date:"";
 }
 
 function inferYearForRange(startToken,endToken,baseYear){
-  const s=startToken.replace(/[.\-]/g,"/"), e=endToken.replace(/[.\-]/g,"/");
-  const sm=s.match(/(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})/);
-  const em=e.match(/(?:(\d{4})\/)?(\d{1,2})\/(\d{1,2})/);
-  if(!sm||!em) return [baseYear,baseYear];
-  let sy=Number(sm[1]||baseYear), ey=Number(em[1]||sy);
-  if(!em[1] && Number(em[2]) < Number(sm[2])) ey=sy+1;
-  return [sy,ey];
+  const a=parseDateToken(startToken,baseYear);
+  if(!a) return [baseYear,baseYear];
+
+  const b=parseDateToken(endToken,baseYear,a.month,a.year);
+  if(!b) return [a.year,a.year];
+
+  let ey=b.year;
+  if(!b.explicitYear && b.explicitMonth && b.month<a.month){
+    ey=a.year+1;
+  }
+  return [a.year,ey];
+}
+
+function extractDateRanges(line,baseYear){
+  // 시작 날짜는 반드시 월/일 또는 년/월/일 형태,
+  // 종료 날짜는 같은 형식 또는 '22일', '22'처럼 일자만 있어도 허용
+  const fullDate='(?:\\d{4}\\s*년\\s*)?\\d{1,2}\\s*월\\s*\\d{1,2}\\s*일?|(?:\\d{4}\\s*[\\/.\\-]\\s*)?\\d{1,2}\\s*[\\/.\\-]\\s*\\d{1,2}';
+  const endDate=`(?:${fullDate}|\\d{1,2}\\s*일?)`;
+  const re=new RegExp(`(${fullDate})\\s*(?:~|～|–|—|-|부터)\\s*(${endDate})(?:\\s*까지)?`,"g");
+
+  const out=[];
+  let m;
+
+  while((m=re.exec(line))){
+    const a=parseDateToken(m[1],baseYear);
+    if(!a) continue;
+
+    let b=parseDateToken(m[2],baseYear,a.month,a.year);
+    if(!b) continue;
+
+    let endYear=b.year;
+    if(!b.explicitYear && b.explicitMonth && b.month<a.month){
+      endYear=a.year+1;
+    }
+
+    if(endYear!==b.year){
+      b={
+        ...b,
+        year:endYear,
+        date:`${endYear}-${String(b.month).padStart(2,"0")}-${String(b.day).padStart(2,"0")}`
+      };
+    }
+
+    out.push({
+      start:a.date,
+      end:b.date,
+      index:m.index,
+      raw:m[0]
+    });
+  }
+
+  return out;
 }
 
 function analyzeVendorText(){
   const text=document.getElementById("vendorText").value.trim();
-  if(!text){alert("분석할 업체 안내문을 입력하세요.");return}
+  if(!text){
+    alert("분석할 업체 안내문을 입력하세요.");
+    return;
+  }
+
   const baseYear=Number(document.getElementById("baseYear").value||new Date().getFullYear());
   const lines=text.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+
   const found=[];
   let current=null;
 
-  const codeRe=/(\d{4}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{1,2})/;
-  const rangeRe=/(\d{1,4}\s*[\/.\-]\s*\d{1,2}(?:\s*[\/.\-]\s*\d{1,2})?)\s*[~～\-]\s*(\d{1,4}\s*[\/.\-]\s*\d{1,2}(?:\s*[\/.\-]\s*\d{1,2})?)/g;
+  const blank=label=>({
+    label:label||`${found.length+1}차`,
+    code:"",
+    mealStart:"",
+    mealEnd:"",
+    delStart:"",
+    delEnd:"",
+    selected:true
+  });
+
+  const hasData=x=>x&&(x.code||x.mealStart||x.mealEnd||x.delStart||x.delEnd);
+
+  const pushCurrent=()=>{
+    if(hasData(current)) found.push(current);
+    current=null;
+  };
 
   for(const line of lines){
-    const codeMatch=line.match(codeRe);
-    const labelMatch=line.match(/((?:\d{1,2}월\s*)?\d+\s*차|제?\s*\d+\s*차)/);
-    if(codeMatch || /발주코드|코드/.test(line)){
-      if(current && (current.code||current.mealStart||current.delStart)) found.push(current);
-      current={label:labelMatch?labelMatch[1].replace(/\s/g,""):`${found.length+1}차`,code:codeMatch?codeMatch[1].replace(/[.\-]/g,"/").replace(/\s/g,""):"",mealStart:"",mealEnd:"",delStart:"",delEnd:"",selected:true};
-    }
-    if(!current) current={label:`${found.length+1}차`,code:"",mealStart:"",mealEnd:"",delStart:"",delEnd:"",selected:true};
+    const labelMatch=line.match(/((?:\d{1,2}월\s*)?(?:제\s*)?\d+\s*차)/);
 
-    const ranges=[...line.matchAll(rangeRe)];
-    if(ranges.length){
-      const target=/배송|입고|납품/.test(line)?"delivery":(/급식|사용|쌀/.test(line)?"meal":(!current.mealStart?"meal":"delivery"));
-      const a=ranges[0][1], b=ranges[0][2];
-      const [sy,ey]=inferYearForRange(a,b,baseYear);
-      if(target==="meal"){
-        current.mealStart=normalizeDateToken(a,sy);
-        current.mealEnd=normalizeDateToken(b,ey);
+    // 발주코드 / 주문코드 / 코드 / 차수 뒤의 값 추출
+    const codeMatch=line.match(/(?:발주\s*코드|주문\s*코드|코드)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_./\-]*)/i);
+
+    if(labelMatch){
+      const label=labelMatch[1].replace(/\s/g,"");
+
+      // 새로운 차수가 시작되면 이전 차수 저장
+      if(current && hasData(current) && current.label!==label){
+        pushCurrent();
+      }
+
+      if(!current) current=blank(label);
+      else current.label=label;
+    }
+
+    if(codeMatch){
+      const code=codeMatch[1].replace(/\s/g,"");
+
+      // 이미 다른 코드가 들어있다면 새 차수로 판단
+      if(current && hasData(current) && current.code && current.code!==code){
+        pushCurrent();
+      }
+
+      if(!current) current=blank();
+      current.code=code;
+    }
+
+    if(!current) current=blank();
+
+    const ranges=extractDateRanges(line,baseYear);
+
+    for(const r of ranges){
+      const before=line.slice(Math.max(0,r.index-40),r.index);
+      const after=line.slice(r.index,r.index+r.raw.length+15);
+      const nearby=before+" "+after;
+
+      let target="";
+
+      if(/배송|납품|입고|도착|배달/.test(nearby)){
+        target="delivery";
+      }else if(/급식|사용기간|사용일|학교사용|식사|식단/.test(nearby)){
+        target="meal";
       }else{
-        current.delStart=normalizeDateToken(a,sy);
-        current.delEnd=normalizeDateToken(b,ey);
+        target=!current.mealStart?"meal":(!current.delStart?"delivery":"meal");
+      }
+
+      if(target==="meal"){
+        // 한 차수 안에 급식+배송이 이미 모두 채워졌는데 또 급식기간이 나오면 새 차수
+        if(current.mealStart && current.delStart){
+          pushCurrent();
+          current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
+          if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+        }
+
+        current.mealStart=r.start;
+        current.mealEnd=r.end;
+      }else{
+        // 한 차수 안에 급식+배송이 이미 모두 채워졌는데 또 배송기간이 나오면 새 차수
+        if(current.delStart && current.mealStart){
+          pushCurrent();
+          current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
+          if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+        }
+
+        current.delStart=r.start;
+        current.delEnd=r.end;
       }
     }
   }
-  if(current && (current.code||current.mealStart||current.delStart)) found.push(current);
 
-  // If one block contains two ranges but lines were poorly separated, try global extraction.
-  if(found.length===0 || found.every(x=>!x.mealStart)){
-    const allCodes=[...text.matchAll(new RegExp(codeRe.source,"g"))].map(m=>m[1].replace(/[.\-]/g,"/").replace(/\s/g,""));
-    const allRanges=[...text.matchAll(rangeRe)].map(m=>[m[1],m[2]]);
-    const count=Math.max(allCodes.length,Math.floor(allRanges.length/2));
-    for(let i=0;i<count;i++){
-      const meal=allRanges[i*2]||["",""], del=allRanges[i*2+1]||["",""];
-      const [msy,mey]=inferYearForRange(meal[0],meal[1],baseYear);
-      const [dsy,dey]=inferYearForRange(del[0],del[1],baseYear);
-      found.push({label:`${i+1}차`,code:allCodes[i]||"",mealStart:normalizeDateToken(meal[0],msy),mealEnd:normalizeDateToken(meal[1],mey),delStart:normalizeDateToken(del[0],dsy),delEnd:normalizeDateToken(del[1],dey),selected:true});
+  pushCurrent();
+
+  // 줄바꿈이 깨져 한 문장처럼 붙은 경우 전체 날짜범위를 순서대로 복구
+  if(!found.length || found.every(x=>!x.mealStart&&!x.delStart)){
+    const ranges=extractDateRanges(text,baseYear);
+
+    for(let i=0;i<ranges.length;i+=2){
+      const meal=ranges[i];
+      const delivery=ranges[i+1];
+
+      found.push({
+        label:`${Math.floor(i/2)+1}차`,
+        code:"",
+        mealStart:meal?.start||"",
+        mealEnd:meal?.end||"",
+        delStart:delivery?.start||"",
+        delEnd:delivery?.end||"",
+        selected:true
+      });
     }
   }
 
-  parsedSchedules=found.filter(x=>x.code||x.mealStart||x.delStart);
+  // 코드 행과 날짜 행이 따로 있어 중복 차수가 생긴 경우 인접 행끼리 보완 병합
+  const merged=[];
+
+  for(const row of found){
+    const prev=merged[merged.length-1];
+
+    const canMerge=
+      prev &&
+      (!prev.mealStart||!prev.delStart) &&
+      (!row.code||!prev.code||row.code===prev.code);
+
+    if(canMerge){
+      prev.code=prev.code||row.code;
+      prev.mealStart=prev.mealStart||row.mealStart;
+      prev.mealEnd=prev.mealEnd||row.mealEnd;
+      prev.delStart=prev.delStart||row.delStart;
+      prev.delEnd=prev.delEnd||row.delEnd;
+
+      if(/^\d+차$/.test(prev.label||"") && row.label){
+        prev.label=row.label;
+      }
+    }else{
+      merged.push({...row});
+    }
+  }
+
+  parsedSchedules=merged.filter(x=>x.code||x.mealStart||x.delStart);
+
   renderParsedSchedules();
-  if(!parsedSchedules.length) alert("일정을 자동으로 찾지 못했습니다. 텍스트를 확인하거나 직접 입력하세요.");
+
+  if(!parsedSchedules.length){
+    alert("날짜를 찾지 못했습니다. 급식기간 또는 배송기간이 포함되어 있는지 확인해주세요.");
+  }
 }
 
 function renderParsedSchedules(){
