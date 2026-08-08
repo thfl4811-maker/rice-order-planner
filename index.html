@@ -995,22 +995,66 @@ function analyzeVendorText(){
     current=null;
   };
 
+  // yyyy/m/d 형태의 날짜형 발주코드 추출
+  function extractCodeDate(line){
+    const matches=[...String(line).matchAll(/\b(\d{4}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{1,2})\b/g)];
+    if(!matches.length) return "";
+
+    // 날짜범위에 포함된 날짜는 제외하고, 가장 앞의 단독 날짜를 우선 코드로 사용
+    const ranges=extractDateRanges(line,baseYear);
+    for(const m of matches){
+      const idx=m.index ?? -1;
+      const insideRange=ranges.some(r=>{
+        const rs=r.index;
+        const re=rs+r.raw.length;
+        return idx>=rs && idx<re;
+      });
+      if(!insideRange){
+        return m[1].replace(/[.\-]/g,"/").replace(/\s/g,"");
+      }
+    }
+
+    // 표 한 행 전체가 한 줄로 OCR된 경우 첫 번째 4자리 연도 날짜가 발주코드인 경우가 많음
+    const labelPos=String(line).search(/(?:\d{1,2}월\s*)?(?:제\s*)?\d+\s*차/);
+    if(labelPos>=0 && matches.length>=2){
+      return matches[0][1].replace(/[.\-]/g,"/").replace(/\s/g,"");
+    }
+
+    return "";
+  }
+
   for(const line of lines){
     const labelMatch=line.match(/((?:\d{1,2}월\s*)?(?:제\s*)?\d+\s*차)/);
-    const codeMatch=line.match(/(?:발주\s*코드|주문\s*코드|코드|차수)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_./\-]*)/i);
+
+    let codeMatch=line.match(/(?:발주\s*코드|주문\s*코드|코드|차수)\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_./\-]*)/i);
+    let inferredCode="";
+
+    if(!codeMatch){
+      inferredCode=extractCodeDate(line);
+    }
 
     if(labelMatch){
       const label=labelMatch[1].replace(/\s/g,"");
-      if(current && hasData(current) && current.label!==label) pushCurrent();
+
+      if(current && hasData(current) && current.label!==label){
+        pushCurrent();
+      }
+
       if(!current) current=blank(label);
       else current.label=label;
     }
 
-    if(codeMatch){
-      const code=codeMatch[1].replace(/\s/g,"");
-      if(current && hasData(current) && current.code && current.code!==code) pushCurrent();
+    const actualCode=codeMatch
+      ? codeMatch[1].replace(/\s/g,"").replace(/[.\-]/g,"/")
+      : inferredCode;
+
+    if(actualCode){
+      if(current && hasData(current) && current.code && current.code!==actualCode){
+        pushCurrent();
+      }
+
       if(!current) current=blank();
-      current.code=code;
+      current.code=actualCode;
     }
 
     if(!current) current=blank();
@@ -1019,6 +1063,16 @@ function analyzeVendorText(){
     const type=detectLineType(line);
 
     if(ranges.length){
+      // 표 한 행이 통째로 한 줄로 OCR된 경우:
+      // 첫 범위=급식기간, 두 번째 범위=배송기간
+      if(labelMatch && ranges.length>=2){
+        current.mealStart=ranges[0].start;
+        current.mealEnd=ranges[0].end;
+        current.delStart=ranges[1].start;
+        current.delEnd=ranges[1].end;
+        continue;
+      }
+
       for(const r of ranges){
         let target=type;
 
@@ -1030,16 +1084,18 @@ function analyzeVendorText(){
           if(current.mealStart && current.delStart){
             pushCurrent();
             current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
-            if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+            if(actualCode) current.code=actualCode;
           }
+
           current.mealStart=r.start;
           current.mealEnd=r.end;
         }else{
           if(current.delStart && current.mealStart){
             pushCurrent();
             current=blank(labelMatch?labelMatch[1].replace(/\s/g,""):"");
-            if(codeMatch) current.code=codeMatch[1].replace(/\s/g,"");
+            if(actualCode) current.code=actualCode;
           }
+
           current.delStart=r.start;
           current.delEnd=r.end;
         }
@@ -1047,10 +1103,21 @@ function analyzeVendorText(){
       continue;
     }
 
-    // 배송일 8/13 처럼 범위가 아니라 하루만 적힌 경우도 허용
+    // 줄이 따로 분리된 OCR:
+    // "8월 1차" 다음 줄에 "2026/8/7"만 있는 경우 발주코드로 연결
+    const trimmed=line.trim();
+    const singleFullDate=trimmed.match(/^(\d{4}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{1,2})$/);
+
+    if(singleFullDate && current && !current.code){
+      current.code=singleFullDate[1].replace(/[.\-]/g,"/").replace(/\s/g,"");
+      continue;
+    }
+
+    // 배송일 8/13 처럼 범위가 아니라 하루만 적힌 경우
     const singles=extractSingleDates(line,baseYear);
     if(singles.length && type){
       const d=singles[0].date;
+
       if(type==="meal"){
         current.mealStart=current.mealStart||d;
         current.mealEnd=current.mealEnd||d;
@@ -1063,50 +1130,6 @@ function analyzeVendorText(){
 
   pushCurrent();
 
-  // 1차 보정: 전체 텍스트에서 라벨 키워드가 포함된 날짜 범위를 다시 직접 탐색
-  if(!found.length || found.every(x=>!x.mealStart&&!x.delStart)){
-    const wholeLines=text.split(/\n+/).filter(Boolean);
-    let fallback=blank("1차");
-
-    for(const line of wholeLines){
-      const type=detectLineType(line);
-      const ranges=extractDateRanges(line,baseYear);
-
-      if(type && ranges.length){
-        const r=ranges[0];
-        if(type==="meal"){
-          fallback.mealStart=r.start;
-          fallback.mealEnd=r.end;
-        }else{
-          fallback.delStart=r.start;
-          fallback.delEnd=r.end;
-        }
-      }
-    }
-
-    if(hasData(fallback)) found.push(fallback);
-  }
-
-  // 2차 보정: 키워드 없이 날짜 범위만 여러 개 있는 경우 순서대로 급식/배송 묶기
-  if(!found.length){
-    const ranges=extractDateRanges(text,baseYear);
-
-    for(let i=0;i<ranges.length;i+=2){
-      const meal=ranges[i];
-      const delivery=ranges[i+1];
-
-      found.push({
-        label:`${Math.floor(i/2)+1}차`,
-        code:"",
-        mealStart:meal?.start||"",
-        mealEnd:meal?.end||"",
-        delStart:delivery?.start||"",
-        delEnd:delivery?.end||"",
-        selected:true
-      });
-    }
-  }
-
   // 인접한 불완전 행 병합
   const merged=[];
 
@@ -1115,7 +1138,7 @@ function analyzeVendorText(){
 
     const canMerge=
       prev &&
-      (!prev.mealStart||!prev.delStart) &&
+      (!prev.mealStart||!prev.delStart||!prev.code) &&
       (!row.code||!prev.code||row.code===prev.code);
 
     if(canMerge){
@@ -1124,9 +1147,38 @@ function analyzeVendorText(){
       prev.mealEnd=prev.mealEnd||row.mealEnd;
       prev.delStart=prev.delStart||row.delStart;
       prev.delEnd=prev.delEnd||row.delEnd;
-      if(/^\d+차$/.test(prev.label||"") && row.label) prev.label=row.label;
+
+      if(/^\d+차$/.test(prev.label||"") && row.label){
+        prev.label=row.label;
+      }
     }else{
       merged.push({...row});
+    }
+  }
+
+  // 발주코드가 빠진 행에 대해 OCR 전체 텍스트에서 4자리 연도 날짜를 순서대로 보충
+  const allCodeDates=[...text.matchAll(/\b(\d{4}\s*[\/.\-]\s*\d{1,2}\s*[\/.\-]\s*\d{1,2})\b/g)]
+    .map(m=>m[1].replace(/[.\-]/g,"/").replace(/\s/g,""));
+
+  const uniqueCodeDates=[];
+  for(const c of allCodeDates){
+    if(!uniqueCodeDates.includes(c)) uniqueCodeDates.push(c);
+  }
+
+  const rowsNeedingCode=merged.filter(x=>!x.code && (x.mealStart||x.delStart));
+
+  // 표 구조에서는 각 차수의 발주코드가 해당 급식 시작일보다 앞선 yyyy/m/d 단독 날짜로 잡힘.
+  // 비어 있는 경우 순차적으로 보충하되 급식시작일과 같은 날짜는 제외.
+  let ci=0;
+  for(const row of rowsNeedingCode){
+    while(ci<uniqueCodeDates.length){
+      const candidate=uniqueCodeDates[ci++];
+      const candidateIso=normalizeDateToken(candidate,baseYear);
+
+      if(candidateIso && candidateIso!==row.mealStart && candidateIso!==row.mealEnd){
+        row.code=candidate;
+        break;
+      }
     }
   }
 
