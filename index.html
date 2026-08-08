@@ -270,6 +270,9 @@ td input,td select{padding:7px 8px;font-size:13px}
         <div class="field"><label>급식 없음</label><input value="0" disabled></div>
       </div>
       <div class="helper">날짜별 기본 사용량은 각 품목의 하루 사용량 × 메뉴 배율로 계산됩니다. 이후 날짜별로 직접 수정할 수 있습니다.</div>
+      <div class="actions">
+        <button class="primary" onclick="confirmItemSettings()">품목 설정 확정 → 날짜별 사용계획</button>
+      </div>
     </div>
   </section>
 
@@ -279,10 +282,14 @@ td input,td select{padding:7px 8px;font-size:13px}
         <h2 style="margin:0">날짜별 급식·쌀 사용계획</h2>
         <div class="actions" style="margin:0">
           <button class="secondary" onclick="applyDefaultAll()">모두 기본값 적용</button>
-          <button class="ghost" onclick="recalcAll()">현재 메뉴 기준 재계산</button>
+          <button class="ghost" onclick="recalcAll()">메뉴 배율 다시 적용</button>
+          <button class="primary" onclick="confirmDailyPlan()">수정값 확정 → 발주 결과 보기</button>
         </div>
       </div>
-      <div class="note">기본값은 자동으로 들어가고, 적은밥·면 특식·찰밥·잡곡밥처럼 다른 날만 수정하는 방식입니다.</div>
+      <div class="note">
+        기본값은 자동으로 들어가고, 적은밥·면 특식·찰밥·잡곡밥처럼 다른 날만 수정하는 방식입니다.<br>
+        <strong>※ ‘메뉴 배율 다시 적용’은 날짜별 직접 수정값을 메뉴 배율 기준으로 다시 계산하므로, 직접 수정이 끝난 뒤에는 누르지 않는 것을 권장합니다.</strong>
+      </div>
       <div style="height:10px"></div>
       <div class="table-wrap">
         <table id="dailyTable">
@@ -477,6 +484,29 @@ function getRatios(){
     none:0
   }
 }
+function confirmItemSettings(){
+  syncItems();
+
+  if(!items.length){
+    alert("쌀 품목을 하나 이상 입력해 주세요.");
+    return;
+  }
+
+  const invalid=items.find(it=>!it.name || Number(it.daily)<0 || Number(it.pack)<=0);
+  if(invalid){
+    alert("품목명, 하루 기본 사용량, 포장단위를 확인해 주세요.");
+    return;
+  }
+
+  if(!schedules.length){
+    alert("발주 일정을 먼저 입력해 주세요.");
+    document.querySelector('[data-tab="schedule"]').click();
+    return;
+  }
+
+  buildDailyPlan();
+}
+
 function menuLabel(v){
   return {normal:"일반밥",small:"적은밥",bowl:"덮밥·비빔밥",fried:"볶음밥",soup:"국밥",porridge:"죽",noodle:"면·파스타 특식",none:"급식 없음",custom:"직접 입력"}[v]||v
 }
@@ -541,7 +571,47 @@ function applyRatioToRow(r){
   items.forEach(it=>r.usage[it.name]=Number((it.daily*ratio).toFixed(2)));
 }
 function applyDefaultAll(){dailyRows.forEach(r=>{r.menu="normal";r.active=true;applyRatioToRow(r)});renderDaily()}
-function recalcAll(){dailyRows.forEach(r=>applyRatioToRow(r));renderDaily()}
+function recalcAll(){
+  syncItems();
+  dailyRows.forEach(r=>applyRatioToRow(r));
+  renderDaily();
+}
+
+function confirmDailyPlan(){
+  syncSchedules();
+  syncItems();
+  syncDaily();
+
+  if(!dailyRows.length){
+    alert("날짜별 사용계획을 먼저 만들어 주세요.");
+    return;
+  }
+
+  const activeRows=dailyRows.filter(r=>r.active);
+  if(!activeRows.length){
+    alert("급식으로 설정된 날짜가 없습니다.");
+    return;
+  }
+
+  // 현재 입력값을 브라우저 저장에도 반영
+  localStorage.setItem("ricePlannerData",JSON.stringify({
+    planName:document.getElementById("planName").value,
+    baseYear:document.getElementById("baseYear").value,
+    excludeWeekend:document.getElementById("excludeWeekend").value,
+    deadlineDays:document.getElementById("deadlineDays").value,
+    schedules,
+    items,
+    dailyRows,
+    ratios:getRatios()
+  }));
+
+  calculateResults();
+
+  const resultTab=document.querySelector('[data-tab="results"]');
+  if(resultTab) resultTab.click();
+
+  window.scrollTo({top:0,behavior:"smooth"});
+}
 
 function calculateResults(){
   syncSchedules();syncItems();syncDaily();
