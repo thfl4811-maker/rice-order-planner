@@ -364,7 +364,7 @@ let items=[];
 let dailyRows=[];
 
 const fmt=n=>Number(n||0).toLocaleString("ko-KR",{maximumFractionDigits:2});
-const dstr=d=>d.toISOString().slice(0,10);
+const dstr=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
 const toDate=s=>{const d=new Date(s+"T00:00:00");return isNaN(d)?null:d}
 const addDays=(d,n)=>{const x=new Date(d);x.setDate(x.getDate()+n);return x}
 const weekdayKo=d=>["일","월","화","수","목","금","토"][d.getDay()];
